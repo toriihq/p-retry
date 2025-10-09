@@ -49,67 +49,81 @@ export class AbortError extends Error {
 	}
 }
 
-const createRetryContext = (error, attemptNumber, options) => {
-	// Minus 1 from attemptNumber because the first attempt does not count as a retry
-	const retriesLeft = options.retries - (attemptNumber - 1);
-
-	return Object.freeze({
-		error,
-		attemptNumber,
-		retriesLeft,
-	});
-};
-
-function calculateDelay(attempt, options) {
+function calculateDelay(retriesConsumed, options) {
+	const attempt = Math.max(1, retriesConsumed + 1);
 	const random = options.randomize ? (Math.random() + 1) : 1;
 
-	let timeout = Math.round(random * Math.max(options.minTimeout, 1) * (options.factor ** (attempt - 1)));
+	let timeout = Math.round(random * options.minTimeout * (options.factor ** (attempt - 1)));
 	timeout = Math.min(timeout, options.maxTimeout);
 
 	return timeout;
 }
 
-async function onAttemptFailure(error, attemptNumber, options, startTime, maxRetryTime) {
-	let normalizedError = error;
-
-	if (!(normalizedError instanceof Error)) {
-		normalizedError = new TypeError(`Non-error was thrown: "${normalizedError}". You should only throw errors.`);
+function calculateRemainingTime(start, max) {
+	if (!Number.isFinite(max)) {
+		return max;
 	}
+
+	return max - (performance.now() - start);
+}
+
+async function onAttemptFailure({error, attemptNumber, retriesConsumed, startTime, options}) {
+	const normalizedError = error instanceof Error
+		? error
+		: new TypeError(`Non-error was thrown: "${error}". You should only throw errors.`);
 
 	if (normalizedError instanceof AbortError) {
 		throw normalizedError.originalError;
 	}
 
-	if (normalizedError instanceof TypeError && !isNetworkError(normalizedError)) {
+	const retriesLeft = Number.isFinite(options.retries)
+		? Math.max(0, options.retries - retriesConsumed)
+		: options.retries;
+
+	const maxRetryTime = options.maxRetryTime ?? Number.POSITIVE_INFINITY;
+
+	const context = Object.freeze({
+		error: normalizedError,
+		attemptNumber,
+		retriesLeft,
+		retriesConsumed,
+	});
+
+	await options.onFailedAttempt(context);
+
+	if (calculateRemainingTime(startTime, maxRetryTime) <= 0) {
 		throw normalizedError;
 	}
 
-	const context = createRetryContext(normalizedError, attemptNumber, options);
+	const consumeRetry = await options.shouldConsumeRetry(context);
 
-	// Always call onFailedAttempt
-	await options.onFailedAttempt(context);
+	const remainingTime = calculateRemainingTime(startTime, maxRetryTime);
 
-	const currentTime = Date.now();
-	if (
-		currentTime - startTime >= maxRetryTime
-		|| attemptNumber >= options.retries + 1
-		|| !(await options.shouldRetry(context))
-	) {
-		throw normalizedError; // Do not retry, throw the original error
+	if (remainingTime <= 0 || retriesLeft <= 0) {
+		throw normalizedError;
 	}
 
-	// Calculate delay before next attempt
-	const delayTime = calculateDelay(attemptNumber, options);
+	if (normalizedError instanceof TypeError && !isNetworkError(normalizedError)) {
+		if (consumeRetry) {
+			throw normalizedError;
+		}
 
-	// Ensure that delay does not exceed maxRetryTime
-	const timeLeft = maxRetryTime - (currentTime - startTime);
-	if (timeLeft <= 0) {
-		throw normalizedError; // Max retry time exceeded
+		options.signal?.throwIfAborted();
+		return false;
 	}
 
-	const finalDelay = Math.min(delayTime, timeLeft);
+	if (!await options.shouldRetry(context)) {
+		throw normalizedError;
+	}
 
-	// Introduce delay
+	if (!consumeRetry) {
+		options.signal?.throwIfAborted();
+		return false;
+	}
+
+	const delayTime = calculateDelay(retriesConsumed, options);
+	const finalDelay = Math.min(delayTime, remainingTime);
+
 	if (finalDelay > 0) {
 		await new Promise((resolve, reject) => {
 			const onAbort = () => {
@@ -132,6 +146,8 @@ async function onAttemptFailure(error, attemptNumber, options, startTime, maxRet
 	}
 
 	options.signal?.throwIfAborted();
+
+	return true;
 }
 
 export default async function pRetry(input, options = {}) {
@@ -147,16 +163,17 @@ export default async function pRetry(input, options = {}) {
 	options.factor ??= 2;
 	options.minTimeout ??= 1000;
 	options.maxTimeout ??= Number.POSITIVE_INFINITY;
+	options.maxRetryTime ??= Number.POSITIVE_INFINITY;
 	options.randomize ??= false;
 	options.onFailedAttempt ??= () => {};
 	options.shouldRetry ??= () => true;
+	options.shouldConsumeRetry ??= () => true;
 
 	// Validate numeric options and normalize edge cases
 	validateNumberOption('factor', options.factor, {min: 0, allowInfinity: false});
 	validateNumberOption('minTimeout', options.minTimeout, {min: 0, allowInfinity: false});
 	validateNumberOption('maxTimeout', options.maxTimeout, {min: 0, allowInfinity: true});
-	const resolvedMaxRetryTime = options.maxRetryTime ?? Number.POSITIVE_INFINITY;
-	validateNumberOption('maxRetryTime', resolvedMaxRetryTime, {min: 0, allowInfinity: true});
+	validateNumberOption('maxRetryTime', options.maxRetryTime, {min: 0, allowInfinity: true});
 
 	// Treat non-positive factor as 1 to avoid zero backoff or negative behavior
 	if (!(options.factor > 0)) {
@@ -166,12 +183,10 @@ export default async function pRetry(input, options = {}) {
 	options.signal?.throwIfAborted();
 
 	let attemptNumber = 0;
-	const startTime = Date.now();
+	let retriesConsumed = 0;
+	const startTime = performance.now();
 
-	// Use validated local value
-	const maxRetryTime = resolvedMaxRetryTime;
-
-	while (attemptNumber < options.retries + 1) {
+	while (Number.isFinite(options.retries) ? retriesConsumed <= options.retries : true) {
 		attemptNumber++;
 
 		try {
@@ -183,7 +198,15 @@ export default async function pRetry(input, options = {}) {
 
 			return result;
 		} catch (error) {
-			await onAttemptFailure(error, attemptNumber, options, startTime, maxRetryTime);
+			if (await onAttemptFailure({
+				error,
+				attemptNumber,
+				retriesConsumed,
+				startTime,
+				options,
+			})) {
+				retriesConsumed++;
+			}
 		}
 	}
 

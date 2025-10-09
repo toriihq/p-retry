@@ -1,6 +1,7 @@
 import process from 'node:process';
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import {performance} from 'node:perf_hooks';
 import {execa} from 'execa';
 import test from 'ava';
 import delay from 'delay';
@@ -175,6 +176,31 @@ test('shouldRetry is not called for AbortError', async t => {
 	}), {message: 'stop'});
 
 	t.is(shouldRetryCalled, 0);
+});
+
+test('AbortError short-circuits callbacks', async t => {
+	const originalError = new Error('stop');
+	let attempts = 0;
+
+	const error = await t.throwsAsync(pRetry(async () => {
+		attempts++;
+		throw new AbortError(originalError);
+	}, {
+		onFailedAttempt() {
+			t.fail('onFailedAttempt should not fire');
+		},
+		shouldRetry() {
+			t.fail('shouldRetry should not fire');
+		},
+		shouldConsumeRetry() {
+			t.fail('shouldConsumeRetry should not fire');
+		},
+		retries: 5,
+		minTimeout: 0,
+	}));
+
+	t.is(error, originalError);
+	t.is(attempts, 1);
 });
 
 // AVA does not support DOMException.
@@ -463,6 +489,68 @@ test.serial('timeouts are incremental with factor', async t => {
 	t.deepEqual(captured, [100, 50, 25]);
 });
 
+test.serial('setTimeout is never called with 0 minTimeout', async t => {
+	let called = false;
+	const originalSetTimeout = setTimeout;
+	globalThis.setTimeout = function_ => {
+		called = true;
+		return originalSetTimeout(function_, 0);
+	};
+
+	t.teardown(() => {
+		globalThis.setTimeout = originalSetTimeout;
+	});
+
+	await t.throwsAsync(pRetry(
+		async () => {
+			throw new Error('test');
+		},
+		{
+			retries: 3,
+			factor: 0.5,
+			minTimeout: 0,
+			maxTimeout: Number.POSITIVE_INFINITY,
+			randomize: false,
+		},
+	));
+
+	t.is(called, false);
+});
+
+test.serial('maxRetryTime uses monotonic clock', async t => {
+	const originalDateNow = Date.now;
+	const originalPerformanceNow = performance.now;
+
+	let simulatedDateNow = 0;
+	Date.now = () => simulatedDateNow;
+
+	let simulatedMonotonicTimestamp = 0;
+	performance.now = () => simulatedMonotonicTimestamp;
+
+	t.teardown(() => {
+		Date.now = originalDateNow;
+		performance.now = originalPerformanceNow;
+	});
+
+	let attempts = 0;
+
+	await t.throwsAsync(pRetry(
+		async () => {
+			attempts++;
+			simulatedMonotonicTimestamp += 60;
+			simulatedDateNow += attempts === 2 ? -1000 : 60;
+			throw new Error('fail');
+		},
+		{
+			maxRetryTime: 100,
+			minTimeout: 0,
+			retries: 5,
+		},
+	), {message: 'fail'});
+
+	t.true(attempts >= 2);
+});
+
 test.serial('minTimeout is respected even with small factor', async t => {
 	const captured = [];
 	const originalSetTimeout = setTimeout;
@@ -518,6 +606,71 @@ test.serial('maxTimeout caps retry delays', async t => {
 	));
 
 	t.deepEqual(captured, [100, 150, 150]);
+});
+
+test.serial('skipped attempts do not impact backoff', async t => {
+	const captured = [];
+	const originalSetTimeout = setTimeout;
+	globalThis.setTimeout = (function_, ms, ...arguments_) => {
+		captured.push(ms);
+		return originalSetTimeout(function_, 0, ...arguments_);
+	};
+
+	t.teardown(() => {
+		globalThis.setTimeout = originalSetTimeout;
+	});
+
+	let attempts = 0;
+
+	await t.throwsAsync(pRetry(
+		async () => {
+			attempts++;
+
+			if (attempts === 1) {
+				throw new Error('skip');
+			}
+
+			throw new Error('fail');
+		},
+		{
+			retries: 3,
+			factor: 2,
+			minTimeout: 100,
+			maxTimeout: Number.POSITIVE_INFINITY,
+			randomize: false,
+			shouldConsumeRetry: ({error}) => error.message !== 'skip',
+		},
+	));
+
+	// Skip should not shift the backoff sequence; it simply retries without consuming budget.
+	t.deepEqual(captured, [100, 200, 400]);
+	// One skipped attempt plus three counted retries, plus the final failure.
+	t.is(attempts, 5);
+});
+
+test('shouldConsumeRetry time counts toward maxRetryTime', async t => {
+	let attempts = 0;
+	const start = Date.now();
+	const maxRetryTime = 200;
+
+	const error = await t.throwsAsync(pRetry(
+		async () => {
+			attempts++;
+			throw new Error('fail');
+		},
+		{
+			maxRetryTime,
+			minTimeout: 0,
+			async shouldConsumeRetry() {
+				await delay(300);
+				return true;
+			},
+		},
+	));
+
+	t.is(error.message, 'fail');
+	t.is(attempts, 1);
+	t.true(Date.now() - start < 1000);
 });
 
 test('maxTimeout lower than minTimeout caps delay', async t => {
@@ -1018,18 +1171,130 @@ test('throws error from shouldRetry', async t => {
 });
 
 test('retriesLeft is Infinity when retries is Infinity', async t => {
-	let observed;
+	const observed = [];
+	const maxAttempts = 4;
 
 	await t.throwsAsync(pRetry(async () => {
 		throw new Error('fail');
 	}, {
 		retries: Number.POSITIVE_INFINITY,
-		onFailedAttempt({retriesLeft}) {
-			observed = retriesLeft;
-			throw new Error('stop');
-		},
 		minTimeout: 0,
+		onFailedAttempt(context) {
+			observed.push(context.retriesLeft);
+			if (observed.length >= maxAttempts) {
+				throw new AbortError('stop');
+			}
+		},
 	}));
 
-	t.is(observed, Number.POSITIVE_INFINITY);
+	for (const retriesLeft of observed) {
+		t.is(retriesLeft, Number.POSITIVE_INFINITY);
+	}
+
+	t.is(observed.length, maxAttempts);
+});
+
+test('shouldConsumeRetry receives normalized error for non-error throws', async t => {
+	let shouldConsumeRetryContext;
+
+	await t.throwsAsync(pRetry(async () => {
+		throw 'foo'; // eslint-disable-line no-throw-literal
+	}, {
+		retries: 0,
+		minTimeout: 0,
+		shouldConsumeRetry(context) {
+			shouldConsumeRetryContext = context;
+			return true;
+		},
+	}), {
+		message: /Non-error/,
+	});
+
+	t.true(shouldConsumeRetryContext.error instanceof TypeError);
+});
+
+test('shouldConsumeRetry returning false still respects retry budget', async t => {
+	let attempts = 0;
+
+	await t.throwsAsync(pRetry(async () => {
+		attempts++;
+		throw new Error('fail');
+	}, {
+		retries: 0,
+		minTimeout: 0,
+		shouldConsumeRetry: () => false,
+	}), {message: 'fail'});
+
+	t.is(attempts, 1);
+});
+
+test('shouldConsumeRetry returning false still calls shouldRetry', async t => {
+	let attempts = 0;
+	let shouldRetryCalls = 0;
+
+	await t.throwsAsync(pRetry(async () => {
+		attempts++;
+		throw new Error('fail');
+	}, {
+		retries: 3,
+		minTimeout: 0,
+		shouldConsumeRetry: () => false,
+		shouldRetry() {
+			shouldRetryCalls++;
+			return false;
+		},
+	}), {message: 'fail'});
+
+	t.is(attempts, 1);
+	t.is(shouldRetryCalls, 1);
+});
+
+test.serial('Only consumed retries advance backoff', async t => {
+	let attempts = 0;
+	const timeouts = [];
+	const maxAttempts = 4;
+	const minTimeout = 50;
+	const factor = 2;
+	const contexts = [];
+	const originalSetTimeout = setTimeout;
+
+	globalThis.setTimeout = (function_, ms) => {
+		timeouts.push(ms);
+		return originalSetTimeout(function_, 0);
+	};
+
+	t.teardown(() => {
+		globalThis.setTimeout = originalSetTimeout;
+	});
+
+	await t.throwsAsync(pRetry(
+		async () => {
+			attempts++;
+
+			if (attempts === 1) {
+				throw new TypeError('skip');
+			}
+
+			if (attempts === maxAttempts) {
+				throw new AbortError('stop');
+			}
+
+			throw new Error('test');
+		},
+		{
+			retries: 2,
+			onFailedAttempt(context) {
+				contexts.push(context);
+			},
+			shouldConsumeRetry({error}) {
+				return error.message !== 'skip';
+			},
+			factor,
+			minTimeout,
+		},
+	));
+
+	t.deepEqual(contexts.map(context => context.retriesConsumed), [0, 0, 1]);
+	t.deepEqual(contexts.map(context => context.retriesLeft), [2, 2, 1]);
+	t.deepEqual(timeouts, [minTimeout, minTimeout * factor]);
 });

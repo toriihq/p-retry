@@ -13,12 +13,24 @@ expectType<Promise<void>>(
 			expectType<RetryContext>(context);
 			expectType<number>(context.attemptNumber);
 			expectType<number>(context.retriesLeft);
+			expectType<number>(context.retriesConsumed);
 		},
 	}),
 );
 expectType<Promise<string>>(
 	pRetry(() => 'foo', {
 		retries: 5,
+	}),
+);
+
+expectType<Promise<string>>(
+	pRetry(async () => 'value', {
+		async shouldConsumeRetry(context) {
+			expectType<RetryContext>(context);
+			expectType<Error>(context.error);
+			return true;
+		},
+		minTimeout: 0,
 	}),
 );
 
