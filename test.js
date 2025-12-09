@@ -765,6 +765,24 @@ test('onFailedAttempt time counts toward maxRetryTime', async t => {
 	t.true(Date.now() - start < 1000);
 });
 
+test('signal already aborted when entering delay phase cancels immediately', async t => {
+	const controller = new AbortController();
+	const start = Date.now();
+
+	// Signal aborts before entering the delay phase (e.g., during input function execution)
+	await t.throwsAsync(pRetry(async () => {
+		controller.abort(fixtureError);
+		throw new Error('input failed');
+	}, {
+		signal: controller.signal,
+		retries: 5,
+		minTimeout: 5000, // Long delay to verify we don't wait
+	}), {is: fixtureError});
+
+	// Should abort immediately, not wait for the 5 second delay
+	t.true(Date.now() - start < 1000);
+});
+
 test('signal abort during delay cancels promptly', async t => {
 	const controller = new AbortController();
 	const start = Date.now();
