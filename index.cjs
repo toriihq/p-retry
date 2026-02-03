@@ -2,7 +2,7 @@
 
 Object.defineProperty(exports, '__esModule', { value: true });
 
-var isNetworkError = require('is-network-error');
+var isNetworkError = require('@toriihq/is-network-error');
 
 function validateRetries(retries) {
 	if (typeof retries === 'number') {
