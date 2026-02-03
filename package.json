@@ -1,6 +1,6 @@
 {
 	"name": "@toriihq/p-retry",
-	"version": "7.1.1-1",
+	"version": "7.1.1-2",
 	"description": "Retry a promise-returning or async function",
 	"license": "MIT",
 	"repository": {
@@ -50,7 +50,7 @@
 		"bluebird"
 	],
 	"dependencies": {
-		"is-network-error": "^1.1.0"
+		"@toriihq/is-network-error": "^1.1.0"
 	},
 	"devDependencies": {
 		"ava": "^6.3.0",
